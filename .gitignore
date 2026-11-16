@@ -1,0 +1,42 @@
+# 构建产物
+build/*
+!build/generated/
+build_pyi/
+dist/
+outputs/
+
+# 分发用的成品 exe
+NRStudio.exe
+nr-app.exe
+
+# 重量级运行时：从 Release 下载，不进 git
+runtime/*
+!runtime/README.txt
+!runtime/dlssnr-amd.ini
+models/
+
+# vendor 只跟踪上游 MIT 源码子集，其余（权重、ffmpeg、旧版本、Vulkan-Headers）本地准备
+vendor/*
+!vendor/DLSSNR-AMD-0.0.9/
+vendor/DLSSNR-AMD-0.0.9/*
+!vendor/DLSSNR-AMD-0.0.9/windows/
+vendor/DLSSNR-AMD-0.0.9/windows/*
+!vendor/DLSSNR-AMD-0.0.9/windows/src/
+!vendor/DLSSNR-AMD-0.0.9/windows/build/
+!vendor/DLSSNR-AMD-0.0.9/windows/shaders/
+!vendor/DLSSNR-AMD-0.0.9/windows/vulkan-loader/
+!vendor/DLSSNR-AMD-0.0.9/LICENSE
+!vendor/DLSSNR-AMD-0.0.9/THIRD_PARTY.md
+!vendor/DLSSNR-AMD-0.0.9/README.md
+
+# 样例只留小文件
+samples/minimax_h3.mp4
+samples/test4k.mp4
+samples/test4k_audio.mp4
+
+# Python
+__pycache__/
+*.pyc
+
+# 工作区
+.workbuddy/

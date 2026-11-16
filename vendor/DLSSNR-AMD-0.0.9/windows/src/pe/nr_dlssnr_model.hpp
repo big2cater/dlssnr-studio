@@ -1,0 +1,270 @@
+#pragma once
+// The DLSS-NR model, once, for both of the DLLs that publish it.
+//
+// Two different OptiScaler lineages reach feature 18 by two different doors and neither is going
+// away:
+//
+//   nvngx.dll_dlssnr.dll   Dagherbou's OptiScaler_DLSSNR (and the v0.2.0 release) loads this beside
+//                          itself and calls dlssnr_call_* / dlssnr_vk_* -- windows/src/pe/nr_dlssnr_forwarder.cpp
+//   _nvngx.dll             wilsjo2's fork from 0.8.1 on loads NO forwarder at all. It takes the NGX
+//                          core's capability block, sets DLSSNR.* on it, and calls
+//                          NVSDK_NGX_D3D12_CreateFeature(cmd, 18, params, &handle) -- windows/src/pe/nr_ngx_core.cpp
+//
+// Behind both doors the work is identical: one nr::pe::Session per graphics API, a Feature handle
+// carrying the extent and the six controls, a seed copy of colour into output, and Session::run_after
+// (D3D12) or Session::run_vulkan. That work lives here so the two entry points cannot drift -- the
+// forwarder was the original and this file is its body, lifted out unchanged.
+//
+// The parameter block is written through its vtable in both cases, even from _nvngx.dll where the
+// block is our own class: the write is what OptiScaler reads back to report what landed, and one code
+// path for it is one thing that can be wrong. Reading is different -- see nr_ngx_core.cpp, which reads
+// its own map directly.
+
+#include "nr_ngx_abi.hpp"
+
+#include <functional>
+
+struct ID3D12Device;
+struct ID3D12GraphicsCommandList;
+struct ID3D12Resource;
+
+namespace nr::pe { class Session; }
+namespace nr::renodx { struct Settings; }   // D3d12BackendFrame::renodx_settings (defined in nr_renodx.hpp)
+namespace nr { struct Preprocess; }
+
+namespace nr::dlssnr {
+
+// The six controls the NGX surface carries, in the order every caller passes them. Defaults are
+// nr::Controls's own, so a caller that reads nothing from the block still gets a sane model.
+struct Controls6 {
+    float intensity = 1.0f;
+    int style = 0;
+    float local_structure = 1.0f;
+    float local_tone = 1.0f;
+    float skin_structure = -1.0f;
+    int use_auto_mask = 1;
+    int noise_every_frame = 0;   // ours (a wilsjo2 layer's NoiseEveryFrame): nr::Controls::noise_every_frame
+    // ours: the highlight curve the colour was encoded with (a wilsjo2 layer's ReversibleMode), for Preprocess's undo:
+    // nr::Controls::reversible_mode
+    int proxy_curve = 0;
+    bool model_capture_allowed = true;
+};
+
+// A guide subrect: where in the allocation this frame's data is, and how much of it.
+// Base and extent are both honoured, as NVIDIA's DLL does -- nr_pe_session.cpp apply_guide_subrect.
+struct Rect {
+    unsigned int x = 0, y = 0, width = 0, height = 0;
+};
+
+// One live feature. Opaque: a handle to the caller, a struct to this file.
+struct Feature;
+
+// ---------------------------------------------------------------------------------------------
+// The caller's parameter block.
+// ---------------------------------------------------------------------------------------------
+
+// Which vtable slot floats live in. Defaults to MSVC's 6 (nr_ngx_abi.hpp), which is both what our own
+// block publishes and where NVIDIA's driver block keeps them.
+void set_float_slot(int slot);
+// Write a float through an arbitrary slot, so a host can find the right one by probing.
+void probe_float(void* params, const char* name, float value, int slot);
+
+// What the reference writes at create, and again at every evaluate. Nothing here reads these back:
+// the controls arrive as arguments. They are written because OptiScaler reads them back to report
+// what landed, and a block answering 0xBAD00000 to all of them looks like a broken integration.
+void write_create_keys(void* params, unsigned int width, unsigned int height, int preset,
+                       int ui_correction, const Controls6& controls);
+void write_evaluate_keys(void* params, const Controls6& controls, bool reset, int depth_inverted);
+
+// Why the last create or evaluate declined, in words; empty when nothing has.
+const char* last_error();
+
+// ---------------------------------------------------------------------------------------------
+// Direct3D 12, through vkd3d-proton.
+// ---------------------------------------------------------------------------------------------
+
+// Returns null on failure, and writes the NGX result code into *out_result either way.
+Feature* create_d3d12(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, void* params,
+                      unsigned int width, unsigned int height, int preset, int ui_correction,
+                      const Controls6& controls, int* out_result);
+
+// NGX result codes, except 0 for "bad arguments", which is what the reference forwarder answers and
+// what the forwarder ABI's callers test for.
+int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* feature, void* params,
+                   ID3D12Resource* color, ID3D12Resource* depth, ID3D12Resource* motion,
+                   ID3D12Resource* output, unsigned int width, unsigned int height,
+                   const Rect& depth_rect, const Rect& motion_rect, int depth_inverted, int reset,
+                   const Controls6& controls, float mv_scale_x, float mv_scale_y);
+
+void release_d3d12(Feature* feature);
+
+// A backend that can take the evaluate's frame instead of everything evaluate_d3d12 does after NR Control is installed
+// (the .asi's D3D12 passthrough, nr_d3d12_passthrough_backend.cpp; no other build sets one). True: it recorded the
+// frame
+// (colour -> output); false: nothing was recorded and evaluate_d3d12 goes on as without it (the Vulkan bridge). Colour and output are the
+// same resource (in UNORDERED_ACCESS) on the RenoDX route's direct frame.
+struct D3d12BackendFrame {
+    ID3D12Device* device;
+    ID3D12GraphicsCommandList* cmd;
+    ID3D12Resource* color;
+    int color_state;    // D3D12_RESOURCE_STATES (this header has no d3d12.h)
+    ID3D12Resource* output;
+    int output_state;   // D3D12_RESOURCE_STATES
+    unsigned int width, height;
+    // The frame's model controls (nr::Controls of the evaluate's Controls6: controls_from).
+    int style;
+    float intensity, local_tone, local_structure, skin_structure;
+    int automatic_mask;
+    int reversible_mode;   // Controls::reversible_mode (proxy_curve)
+    int noise_every_frame;
+    int history_f16;       // [Network] History Precision 16 (else 32), as the session reads dlssnr-amd.ini
+    int style_grade;       // [Network] Style Grade (live, as the Vulkan runtime's set_style_grade)
+    // The temporal inputs, as the session's EngineResources takes them (evaluate_d3d12): the motion guide in
+    // NON_PIXEL_SHADER_RESOURCE, its subrect (0 extent: the whole texture), MVecScale over the region's extent
+    // (normalized_mv_scale), DLSSNR.Reset, the feature (its history).
+    ID3D12Resource* motion;
+    unsigned int motion_x, motion_y, motion_w, motion_h;
+    float motion_scale_x, motion_scale_y;
+    ID3D12Resource* depth;
+    unsigned int depth_x, depth_y, depth_w, depth_h;
+    int depth_inverted;
+    int reset;
+    unsigned long long feature;
+    float history_strength;   // < 0: the session's
+    // The RenoDX route installed (OptiScaler's encode / resolve skipped: nr_pe_optifix.cpp).
+    int renodx_route;
+    // The RenoDX route's own frame, as evaluate_d3d12 builds it for the bridge (nr_pe_session.hpp RenoDXFrame)
+    // - the backend runs the RenoDX stage on the D3D12 passthrough from these. Null settings: not the RenoDX route.
+    const nr::renodx::Settings* renodx_settings;
+    int renodx_present;            // 0 the DLSS-output path, 2 HDR10, 3 scRGB (the .asi's Present layer)
+    float renodx_white_nits;
+    int renodx_hdr_flag;           // the game's colour is HDR (OptiScaler's judgement)
+    int renodx_after_upscale;      // NR runs on the upscaler's output
+    int renodx_fast_motion;        // a bound neutral texture is not a provider for temporal fast passes
+    // RenoDX's NR screenshot (nr_screenshot.hpp): this frame is OptiScaler's finished picture (NR moved there for the
+    // capture, nr_pe_optifix.cpp lock_all), and the third in a row with no inline NR between them (note_finished)
+    int renodx_finished;
+    int renodx_clean;
+    ID3D12Resource* exposure;      // the game's exposure texture, as DLSS got it
+    int exposure_state;
+    float pre_exposure, exposure_scale;
+    int auto_exposure, create_flags_known;
+    // [Preprocess] settings (nr::Preprocess)
+    int preprocess;
+    int prep_exposure;
+    float prep_bias_ev;
+    int prep_curve;
+    float prep_contrast;
+    float prep_saturation;
+    int prep_inverse;
+    // Passes (fast) Interleaved's pass (a wilsjo2 layer on the D3D12 flow, route::CallHistory): the history it made for
+    // this call (RGBA16F at the frame's extent, in UNORDERED_ACCESS; null: the feature's own), and the network plain
+    // (Intensity 1 already in `intensity`, no Style grade)
+    ID3D12Resource* history;
+    int no_grade;
+    // (out, may be null): set to 1 by a backend that returns false only because its network for this extent is still
+    // being made - it will take such frames; evaluate_d3d12 then passes the frame through (output := colour) with no NR
+    // and does not start the Vulkan bridge's network for them.
+    int* waiting;
+};
+using D3d12Backend = bool (*)(const D3d12BackendFrame& frame);
+void set_d3d12_backend(D3d12Backend backend);
+// This thread's evaluates are the network calls of the wilsjo2 processing's D3D12 flow (nr_asi_wilsjo2.cpp, around
+// them): the backend takes them too, not only the RenoDX processing's frames.
+void set_d3d12_native_call(bool on);
+
+// The frame's keys, once a frame: [RenoDX] NRToggleKey (NR on / off for this run) and the screenshot keys. True while NR
+// is on. The OptiScaler route's evaluate does it itself; the .asi's NR chain calls it once before its layers.
+bool frame_keys();
+// NR on / off as the last frame_keys left it (no keys read): for the .asi's Present layers.
+bool nr_on_now();
+
+// The .asi route (nr_asi_main.cpp, upstream OptiScaler): the D3D12 session keeps the caller's command-list state
+// across the network's recording (Session::set_keep_caller_state). Before the first create.
+void keep_caller_state();
+
+// The .asi's wilsjo2 style (nr_asi_wilsjo2.cpp): its own passes around the model's evaluate are recorded through the
+// D3D12 session (Session::record_raw), under the lock every evaluate holds.
+void with_d3d12_session(const std::function<void(nr::pe::Session&)>& fn);
+// The wanted network (stepped by evaluate_d3d12 from dlssnr-amd.ini and the hotkey; -1 before the first evaluate).
+int frame_network();
+// [Preprocess] as this frame has it (dlssnr-amd.ini, re-read at most once a second, and its hotkey) - for a wilsjo2
+// layer that runs it itself (it then sets Wilsjo2Facts::prep_outside, and the network's runtime does not run it).
+nr::Preprocess preprocess_settings();
+
+// ---------------------------------------------------------------------------------------------
+// Vulkan.
+// ---------------------------------------------------------------------------------------------
+
+// Learns the device and looks for a queue to upload the weights on. Returns an NGX result code;
+// FAIL_UnableToInitializeFeature means no queue is known, which is the documented decline.
+int vk_init(void* instance, void* physical_device, void* device);
+// After vk_init: the lock every submit of the Vulkan session takes on its queue (the .asi's D3D11 route: DXVK's
+// submission-queue lock), in place of the per-queue one.
+void vk_queue_lock(const std::function<void()>& lock, const std::function<void()>& unlock);
+// The game destroys the Vulkan device the session runs on (the .asi's Vulkan route, from its vkDestroyDevice detour,
+// before the real call; every feature of the session already released): the session goes with everything it made
+// while the device is still there, and a later vk_init may start one on another device.
+void vk_device_destroyed();
+// The process is ending (DLL_PROCESS_DETACH with a non-null reserved): its other threads are gone, perhaps inside
+// vkd3d-proton's / DXVK's locks, and the modules loaded after this one (d3d12, winevulkan) are detached already. The
+// sessions are left as they are (their totals logged), not destroyed: a destructor's GPU wait or queue lock could
+// wait for ever, and the game would never end.
+void abandon_at_exit();
+// Whether vk_init has succeeded, i.e. whether a create can be attempted at all.
+bool vk_ready();
+
+Feature* create_vk(void* cmd_buffer, void* params, unsigned int width, unsigned int height,
+                   int preset, int ui_correction, const Controls6& controls, int* out_result);
+
+// The resources are NVSDK_NGX_Resource_VK*; buffers are declined rather than reinterpreted.
+int evaluate_vk(void* cmd_buffer, Feature* feature, void* params, const void* color,
+                const void* depth, const void* motion, const void* output, unsigned int width,
+                unsigned int height, const Rect& depth_rect, const Rect& motion_rect,
+                int depth_inverted, int reset, const Controls6& controls, float mv_scale_x,
+                float mv_scale_y);
+
+void release_vk(Feature* feature);
+
+// The .asi on a Vulkan game (nr_asi_main.cpp, the exported NVSDK_NGX_VULKAN_EvaluateFeature): an image as the caller
+// holds it during the call. `image` / `format` are VkImage / VkFormat, `layout` / `usage` VkImageLayout /
+// VkImageUsageFlags (the hpp names no Vulkan type).
+struct VkImageRef {
+    uint64_t image = 0;
+    uint32_t format = 0, width = 0, height = 0;
+    uint32_t layout = 1;   // VK_IMAGE_LAYOUT_GENERAL
+    uint32_t usage = 0;
+};
+// A feature for the .asi's Vulkan route (the session's queue as vk_init found it): as create_vk, without NGX keys.
+Feature* create_vk_asi(unsigned int width, unsigned int height, int* out_result);
+// One run of NR recorded into the game's command buffer `cmd`: `colour` read, `output` written (the same image: in
+// place, in its layout). The RenoDX style when renodx_route says so for this call (CallStyle, begin_run, note_encode),
+// else the network alone, as NVIDIA's DLL composes (the wilsjo2 style's model pass). `depth` / `motion` with image 0:
+// none. An NGX result; a frame NR did not run on is a Success with `output` unchanged when it is `colour`, else seeded
+// with the colour.
+int evaluate_vk_asi(void* cmd, Feature* feature, const VkImageRef& colour, const VkImageRef& output,
+                    const VkImageRef& depth, const VkImageRef& motion, unsigned int width, unsigned int height,
+                    const Rect& depth_rect, const Rect& motion_rect, int depth_inverted, int reset,
+                    const Controls6& controls, float mv_scale_x, float mv_scale_y, bool* ran_out = nullptr);
+// The Vulkan session, for the .asi's wilsjo2 style on Vulkan (its own passes recorded beside the model's), under the
+// lock every evaluate holds.
+void with_vk_session(const std::function<void(nr::pe::Session&)>& fn);
+// The same three on the D3D12 session's bridge (the .asi's wilsjo2 style on a native D3D12 game, its flow recorded on
+// the command buffer of one Session::bridge12_begin recording): the D3D12 session's networks on the bridge's device,
+// `cmd` that recording's.
+Feature* create_bridge12(unsigned int width, unsigned int height, int* out_result);
+int evaluate_bridge12(void* cmd, Feature* feature, const VkImageRef& colour, const VkImageRef& output,
+                      const VkImageRef& depth, const VkImageRef& motion, unsigned int width, unsigned int height,
+                      const Rect& depth_rect, const Rect& motion_rect, int depth_inverted, int reset,
+                      const Controls6& controls, float mv_scale_x, float mv_scale_y);
+void release_bridge12(Feature* feature);
+// A command buffer the Vulkan session recorded into was not submitted: its timing is not read (Session::discard_timing;
+// nothing when there is no session yet).
+void discard_vk_timing();
+// A layer of the .asi's chain changed (processing, placement, network) or went: Session::reset_layer_timing on every
+// session there is (none is made for it).
+void layer_changed(int layer);
+// The wilsjo2 native route's GPU time of one run (its programs + the D3D12 network), for NR Control's line.
+void note_native_ms(float ms);
+
+}  // namespace nr::dlssnr

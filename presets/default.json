@@ -1,0 +1,27 @@
+{
+  "neural_rendering": {
+    "model": "small",
+    "intensity": 1.0,
+    "style": 0,
+    "passes": 1,
+    "local_tone": 1.0,
+    "local_structure": 1.0,
+    "skin_structure": -1.0,
+    "automatic_mask": true
+  },
+  "video": {
+    "temporal": true,
+    "noise_every_frame": true,
+    "codec": "auto",
+    "crf": 18
+  },
+  "output": {
+    "suffix": "_visual_enhancer",
+    "image_ext": "png"
+  },
+  "runtime": {
+    "aco": true,
+    "batch": 1,
+    "rgba8": true
+  }
+}
