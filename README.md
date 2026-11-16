@@ -1,5 +1,7 @@
 # DLSSNR-AMD Studio
 
+> 继任 [dlss5-visual-enhancer-zluda](https://github.com/big2cater/dlss5-visual-enhancer-zluda)（已归档）：此后的更新都发布在本仓库。
+
 把 [DLSSNR-AMD](https://github.com/mochizuki0323/DLSSNR-AMD)（NVIDIA DLSS 5 神经渲染网络在 AMD RDNA 显卡上的 Vulkan/ACO 重实现）包成一个**双击即用的 Windows 桌面应用**：原生 PySide6 界面、批量队列、视频全流程，不需要网页、不需要命令行。
 
 ## 下载即用
